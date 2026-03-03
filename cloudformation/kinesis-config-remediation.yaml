@@ -1,0 +1,391 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AWS Config rule that detects Kinesis streams without CMK encryption
+  and auto-remediates by creating a CMK and enabling encryption.
+
+Resources:
+
+  # -------------------------------------------------------
+  # CMK used by remediation to encrypt non-compliant streams
+  # -------------------------------------------------------
+  RemediationCMK:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK applied by Config auto-remediation to Kinesis streams
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableRootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowKinesisService
+            Effect: Allow
+            Principal:
+              Service: kinesis.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+          - Sid: AllowSSMAutomationServiceUse
+            Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action:
+              - kms:DescribeKey
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+      Tags:
+        - Key: Purpose
+          Value: config-remediation
+
+  RemediationCMKAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/kinesis-config-remediation-cmk
+      TargetKeyId: !Ref RemediationCMK
+
+  # -------------------------------------------------------
+  # IAM Role — Lambda execution for Config rule evaluation
+  # -------------------------------------------------------
+  ConfigRuleLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: kinesis-config-rule-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ConfigEvaluationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - config:PutEvaluations
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:ListStreams
+                Resource: "*"
+
+  # -------------------------------------------------------
+  # Lambda — evaluates Kinesis streams for CMK compliance
+  # -------------------------------------------------------
+  ConfigRuleLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: kinesis-cmk-config-evaluator
+      Description: Config rule evaluator — checks Kinesis streams use a CMK not aws/kinesis
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ConfigRuleLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          kinesis = boto3.client('kinesis')
+          config  = boto3.client('config')
+
+          def is_cmk(encryption_type, key_id):
+              """
+              Returns True only if the stream uses a customer managed key.
+              Rejects NONE and the AWS-managed key (aws/kinesis).
+              """
+              if encryption_type != 'KMS':
+                  return False
+              if not key_id:
+                  return False
+              # AWS-managed key identifiers contain 'aws/kinesis'
+              if 'aws/kinesis' in str(key_id):
+                  return False
+              return True
+
+          def evaluate_stream(stream_name):
+              try:
+                  resp = kinesis.describe_stream_summary(StreamName=stream_name)
+                  summary = resp['StreamDescriptionSummary']
+                  enc_type = summary.get('EncryptionType', 'NONE')
+                  key_id   = summary.get('KeyId', '')
+                  compliant = is_cmk(enc_type, key_id)
+                  logger.info(
+                      "Stream %s — EncryptionType=%s KeyId=%s Compliant=%s",
+                      stream_name, enc_type, key_id, compliant
+                  )
+                  return 'COMPLIANT' if compliant else 'NON_COMPLIANT'
+              except kinesis.exceptions.ResourceNotFoundException:
+                  return 'NOT_APPLICABLE'
+              except Exception as e:
+                  logger.error("Error evaluating stream %s: %s", stream_name, str(e))
+                  return 'NON_COMPLIANT'
+
+          def handler(event, context):
+              invoking_event = json.loads(event['invokingEvent'])
+              result_token   = event['resultToken']
+
+              # Scheduled run — evaluate ALL streams
+              if event.get('eventLeftScope') is False or \
+                 invoking_event.get('messageType') == 'ScheduledNotification':
+                  paginator = kinesis.get_paginator('list_streams')
+                  evaluations = []
+                  for page in paginator.paginate():
+                      for stream in page.get('StreamSummaries', []):
+                          compliance = evaluate_stream(stream['StreamName'])
+                          evaluations.append({
+                              'ComplianceResourceType': 'AWS::Kinesis::Stream',
+                              'ComplianceResourceId':   stream['StreamName'],
+                              'ComplianceType':         compliance,
+                              'OrderingTimestamp':      invoking_event.get(
+                                  'notificationCreationTime',
+                                  context.invoked_function_arn
+                              )
+                          })
+                  if evaluations:
+                      # PutEvaluations max 100 per call
+                      for i in range(0, len(evaluations), 100):
+                          config.put_evaluations(
+                              Evaluations=evaluations[i:i+100],
+                              ResultToken=result_token
+                          )
+                  return
+
+              # Change-triggered — evaluate the specific stream
+              ci = invoking_event.get('configurationItem', {})
+              if ci.get('resourceType') != 'AWS::Kinesis::Stream':
+                  return
+
+              compliance = evaluate_stream(ci['resourceName'])
+              config.put_evaluations(
+                  Evaluations=[{
+                      'ComplianceResourceType': 'AWS::Kinesis::Stream',
+                      'ComplianceResourceId':   ci['resourceName'],
+                      'ComplianceType':         compliance,
+                      'OrderingTimestamp':      ci['configurationItemCaptureTime']
+                  }],
+                  ResultToken=result_token
+              )
+
+  # Allow Config to invoke the Lambda
+  ConfigLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ConfigRuleLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # -------------------------------------------------------
+  # Config Rule
+  # -------------------------------------------------------
+  KinesisCMKConfigRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigLambdaPermission
+    Properties:
+      ConfigRuleName: kinesis-streams-must-use-cmk
+      Description: >
+        Checks that all Kinesis Data Streams use a Customer Managed Key (CMK)
+        for encryption. Streams using no encryption or the AWS-managed key
+        (aws/kinesis) are marked NON_COMPLIANT and auto-remediated.
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: !GetAtt ConfigRuleLambda.Arn
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ConfigurationItemChangeNotification
+          - EventSource: aws.config
+            MessageType: ScheduledNotification
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::Kinesis::Stream
+
+  # -------------------------------------------------------
+  # IAM Role — SSM Automation remediation
+  # -------------------------------------------------------
+  SSMRemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: kinesis-config-ssm-remediation-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KinesisRemediationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:StartStreamEncryption
+                  - kinesis:DescribeStreamSummary
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kms:DescribeKey
+                  - kms:CreateGrant
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                Resource: !GetAtt RemediationCMK.Arn
+              - Effect: Allow
+                Action:
+                  - config:PutEvaluations
+                Resource: "*"
+
+  # -------------------------------------------------------
+  # SSM Automation Document — enables CMK encryption
+  # -------------------------------------------------------
+  KinesisEnableCMKDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: Kinesis-EnableCMKEncryption
+      DocumentType: Automation
+      Content:
+        schemaVersion: "0.3"
+        description: >
+          Enables CMK encryption on a non-compliant Kinesis Data Stream.
+          Called automatically by AWS Config remediation.
+        assumeRole: "{{ AutomationAssumeRole }}"
+        parameters:
+          StreamName:
+            type: String
+            description: Name of the Kinesis stream to remediate
+          CMKArn:
+            type: String
+            description: ARN of the CMK to use for encryption
+          AutomationAssumeRole:
+            type: String
+            description: IAM role ARN for SSM Automation to assume
+        mainSteps:
+          - name: CheckCurrentEncryption
+            action: aws:executeAwsApi
+            description: Check current encryption state before remediating
+            inputs:
+              Service: kinesis
+              Api: DescribeStreamSummary
+              StreamName: "{{ StreamName }}"
+            outputs:
+              - Name: EncryptionType
+                Selector: $.StreamDescriptionSummary.EncryptionType
+                Type: String
+              - Name: StreamStatus
+                Selector: $.StreamDescriptionSummary.StreamStatus
+                Type: String
+
+          - name: WaitForStreamActive
+            action: aws:waitForAwsResourceProperty
+            description: Wait until stream is ACTIVE before modifying
+            inputs:
+              Service: kinesis
+              Api: DescribeStreamSummary
+              StreamName: "{{ StreamName }}"
+              PropertySelector: $.StreamDescriptionSummary.StreamStatus
+              DesiredValues:
+                - ACTIVE
+
+          - name: EnableCMKEncryption
+            action: aws:executeAwsApi
+            description: Enable CMK encryption on the stream
+            inputs:
+              Service: kinesis
+              Api: StartStreamEncryption
+              StreamName: "{{ StreamName }}"
+              EncryptionType: KMS
+              KeyId: "{{ CMKArn }}"
+
+          - name: VerifyEncryption
+            action: aws:waitForAwsResourceProperty
+            description: Confirm encryption is now ACTIVE with KMS
+            timeoutSeconds: 120
+            inputs:
+              Service: kinesis
+              Api: DescribeStreamSummary
+              StreamName: "{{ StreamName }}"
+              PropertySelector: $.StreamDescriptionSummary.EncryptionType
+              DesiredValues:
+                - KMS
+
+  # -------------------------------------------------------
+  # Config Remediation Configuration
+  # -------------------------------------------------------
+  KinesisRemediationConfig:
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+      ConfigRuleName: !Ref KinesisCMKConfigRule
+      TargetType: SSM_DOCUMENT
+      TargetId: !Ref KinesisEnableCMKDocument
+      Automatic: true
+      MaximumAutomaticAttempts: 3
+      RetryAttemptSeconds: 60
+      Parameters:
+        StreamName:
+          ResourceValue:
+            Value: RESOURCE_ID
+        CMKArn:
+          StaticValue:
+            Values:
+              - !GetAtt RemediationCMK.Arn
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !GetAtt SSMRemediationRole.Arn
+
+# -------------------------------------------------------
+# Outputs
+# -------------------------------------------------------
+Outputs:
+  ConfigRuleName:
+    Description: Config rule name
+    Value: !Ref KinesisCMKConfigRule
+
+  RemediationCMKArn:
+    Description: CMK ARN used for auto-remediation
+    Value: !GetAtt RemediationCMK.Arn
+
+  RemediationCMKAlias:
+    Description: CMK alias
+    Value: !Ref RemediationCMKAlias
+
+  SSMDocumentName:
+    Description: SSM Automation document name
+    Value: !Ref KinesisEnableCMKDocument
+
+  TestCommandTriggerRemediation:
+    Description: Manually trigger remediation on a non-compliant stream
+    Value: !Sub >
+      aws config start-remediation-execution
+      --config-rule-name kinesis-streams-must-use-cmk
+      --resource-keys resourceType=AWS::Kinesis::Stream,resourceId=<stream-name>
+      --profile Sandbox --region ${AWS::Region}
+
+  TestCommandGetComplianceStatus:
+    Description: Check compliance status of all Kinesis streams
+    Value: !Sub >
+      aws config get-compliance-details-by-config-rule
+      --config-rule-name kinesis-streams-must-use-cmk
+      --profile Sandbox --region ${AWS::Region}

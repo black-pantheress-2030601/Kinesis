@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyKinesisStopStreamEncryption",
+      "Effect": "Deny",
+      "Action": "kinesis:StopStreamEncryption",
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyKinesisFISActions",
+      "Effect": "Deny",
+      "Action": "kinesis:InjectApiError",
+      "Resource": "*"
+    }
+  ]
+}

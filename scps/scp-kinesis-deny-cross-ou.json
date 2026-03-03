@@ -1,0 +1,34 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyKinesisResourcePolicyGrants",
+      "Effect": "Deny",
+      "Action": [
+        "kinesis:PutResourcePolicy"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyKinesisCrossOUDataPlane",
+      "Effect": "Deny",
+      "Action": [
+        "kinesis:GetRecords",
+        "kinesis:GetShardIterator",
+        "kinesis:SubscribeToShard",
+        "kinesis:PutRecord",
+        "kinesis:PutRecords",
+        "kinesis:RegisterStreamConsumer",
+        "kinesis:DeregisterStreamConsumer"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotLike": {
+          "aws:ResourceOrgPaths": [
+            "o-<orgid>/r-<rootid>/ou-<thisOU-id>/*"
+          ]
+        }
+      }
+    }
+  ]
+}

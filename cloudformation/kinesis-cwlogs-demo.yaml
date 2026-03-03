@@ -1,0 +1,240 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudWatch Logs -> Kinesis Data Stream -> Lambda pipeline demo.
+  Subscribes a demo log group to the existing scp-demo-stream and
+  deploys a Lambda consumer that decodes and logs Kinesis records.
+
+Parameters:
+  KinesisStackName:
+    Type: String
+    Default: kinesis-scp-demo
+    Description: Name of the existing Kinesis stack to import values from
+
+  LogGroupName:
+    Type: String
+    Default: /demo/kinesis-test
+    Description: CloudWatch Log Group to create and subscribe to Kinesis
+
+  FilterPattern:
+    Type: String
+    Default: ""
+    Description: CloudWatch subscription filter pattern (empty = all events)
+
+Resources:
+
+  # -------------------------------------------------------
+  # Demo CloudWatch Log Group
+  # -------------------------------------------------------
+  DemoLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref LogGroupName
+      RetentionInDays: 7
+
+  # -------------------------------------------------------
+  # IAM Role — allows CloudWatch Logs to write to Kinesis
+  # -------------------------------------------------------
+  CWLogsToKinesisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cwlogs-to-kinesis-subscription-role
+      Description: Allows CloudWatch Logs to put records into Kinesis stream
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action: sts:AssumeRole
+            Condition:
+              StringLike:
+                aws:SourceArn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+      Policies:
+        - PolicyName: PutKinesisRecords
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource:
+                  Fn::ImportValue: !Sub "${KinesisStackName}-StreamArn"
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                Resource:
+                  Fn::ImportValue: !Sub "${KinesisStackName}-CMKArn"
+
+  # -------------------------------------------------------
+  # Subscription Filter — pipes log events into Kinesis
+  # -------------------------------------------------------
+  CWLogsSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn: CWLogsToKinesisRole
+    Properties:
+      LogGroupName: !Ref DemoLogGroup
+      FilterName: kinesis-demo-filter
+      FilterPattern: !Ref FilterPattern
+      DestinationArn:
+        Fn::ImportValue: !Sub "${KinesisStackName}-StreamArn"
+      RoleArn: !GetAtt CWLogsToKinesisRole.Arn
+      Distribution: ByLogStream
+
+  # -------------------------------------------------------
+  # Lambda Execution Role
+  # -------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: kinesis-log-consumer-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KinesisConsumerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:ListShards
+                  - kinesis:ListStreams
+                Resource:
+                  Fn::ImportValue: !Sub "${KinesisStackName}-StreamArn"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource:
+                  Fn::ImportValue: !Sub "${KinesisStackName}-CMKArn"
+
+  # -------------------------------------------------------
+  # Lambda Consumer — decodes and logs Kinesis records
+  # -------------------------------------------------------
+  KinesisConsumerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: kinesis-log-consumer
+      Description: Decodes CloudWatch log events from Kinesis and logs them
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+      Code:
+        ZipFile: |
+          import base64
+          import gzip
+          import json
+          import logging
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+
+          def handler(event, context):
+              records_processed = 0
+
+              for record in event.get("Records", []):
+                  # Decode base64 Kinesis payload
+                  raw = base64.b64decode(record["kinesis"]["data"])
+
+                  # CloudWatch Logs compresses subscription data with gzip
+                  try:
+                      payload = json.loads(gzip.decompress(raw))
+                  except Exception:
+                      # Not gzip — treat as raw JSON or string
+                      try:
+                          payload = json.loads(raw)
+                      except Exception:
+                          payload = raw.decode("utf-8", errors="replace")
+
+                  log_group   = payload.get("logGroup", "unknown")
+                  log_stream  = payload.get("logStream", "unknown")
+                  log_events  = payload.get("logEvents", [])
+
+                  logger.info(
+                      "Received %d log event(s) from log group [%s] stream [%s]",
+                      len(log_events), log_group, log_stream
+                  )
+
+                  for evt in log_events:
+                      logger.info(
+                          "[%s] id=%s | %s",
+                          log_group,
+                          evt.get("id", "-"),
+                          evt.get("message", "")
+                      )
+
+                  records_processed += 1
+
+              return {"batchItemFailures": [], "recordsProcessed": records_processed}
+
+  # -------------------------------------------------------
+  # Lambda Event Source Mapping — triggers Lambda from Kinesis
+  # -------------------------------------------------------
+  KinesisEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn:
+        Fn::ImportValue: !Sub "${KinesisStackName}-StreamArn"
+      FunctionName: !GetAtt KinesisConsumerLambda.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+      BisectBatchOnFunctionError: true
+
+  # -------------------------------------------------------
+  # Lambda Log Group (explicit, with retention)
+  # -------------------------------------------------------
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${KinesisConsumerLambda}"
+      RetentionInDays: 7
+
+# -------------------------------------------------------
+# Outputs
+# -------------------------------------------------------
+Outputs:
+  DemoLogGroupName:
+    Description: Log group to write test events to
+    Value: !Ref DemoLogGroup
+
+  LambdaFunctionName:
+    Description: Kinesis consumer Lambda name
+    Value: !Ref KinesisConsumerLambda
+
+  LambdaLogGroup:
+    Description: Lambda output log group
+    Value: !Ref LambdaLogGroup
+
+  TestCommandPutLogEvent:
+    Description: Send a test log event to trigger the full pipeline
+    Value: !Sub >
+      aws logs put-log-events
+      --log-group-name ${LogGroupName}
+      --log-stream-name test-stream-1
+      --log-events timestamp=$(date +%s000),message='{"service":"demo","level":"INFO","msg":"hello kinesis"}'
+      --profile Work --region ${AWS::Region}
+
+  WatchLambdaLogs:
+    Description: Tail Lambda logs to see decoded Kinesis records
+    Value: !Sub >
+      aws logs tail /aws/lambda/kinesis-log-consumer
+      --follow
+      --profile Work --region ${AWS::Region}

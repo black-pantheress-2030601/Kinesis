@@ -1,0 +1,63 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyNonProdAccessToProdKinesisStreams",
+      "Effect": "Deny",
+      "Action": [
+        "kinesis:GetRecords",
+        "kinesis:GetShardIterator",
+        "kinesis:SubscribeToShard",
+        "kinesis:PutRecord",
+        "kinesis:PutRecords",
+        "kinesis:RegisterStreamConsumer",
+        "kinesis:DeregisterStreamConsumer",
+        "kinesis:DescribeStream",
+        "kinesis:DescribeStreamSummary",
+        "kinesis:ListShards"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "aws:PrincipalOrgPaths": [
+            "o-<orgid>/r-<rootid>/ou-<nonprod-ou-id>/*"
+          ]
+        },
+        "StringLike": {
+          "aws:ResourceOrgPaths": [
+            "o-<orgid>/r-<rootid>/ou-<prod-ou-id>/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DenyProdAccessToNonProdKinesisStreams",
+      "Effect": "Deny",
+      "Action": [
+        "kinesis:GetRecords",
+        "kinesis:GetShardIterator",
+        "kinesis:SubscribeToShard",
+        "kinesis:PutRecord",
+        "kinesis:PutRecords",
+        "kinesis:RegisterStreamConsumer",
+        "kinesis:DeregisterStreamConsumer",
+        "kinesis:DescribeStream",
+        "kinesis:DescribeStreamSummary",
+        "kinesis:ListShards"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "aws:PrincipalOrgPaths": [
+            "o-<orgid>/r-<rootid>/ou-<prod-ou-id>/*"
+          ]
+        },
+        "StringLike": {
+          "aws:ResourceOrgPaths": [
+            "o-<orgid>/r-<rootid>/ou-<nonprod-ou-id>/*"
+          ]
+        }
+      }
+    }
+  ]
+}

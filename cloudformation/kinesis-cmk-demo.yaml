@@ -1,0 +1,242 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Demo Kinesis Data Stream with CMK encryption for SCP testing.
+  Deploys a KMS Customer Managed Key, a Kinesis stream, and IAM roles
+  for producer/consumer testing.
+
+Parameters:
+  StreamName:
+    Type: String
+    Default: scp-demo-stream
+    Description: Name of the Kinesis Data Stream
+
+  ShardCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of shards (keep at 1 for demo purposes)
+
+  RetentionPeriodHours:
+    Type: Number
+    Default: 24
+    MinValue: 24
+    MaxValue: 168
+    Description: Stream retention period in hours
+
+  Environment:
+    Type: String
+    Default: nonprod
+    AllowedValues:
+      - prod
+      - nonprod
+    Description: Environment tag
+
+Resources:
+
+  # -------------------------------------------------------
+  # KMS Customer Managed Key
+  # No role ARN references here — grants managed via IAM policies
+  # -------------------------------------------------------
+  KinesisStreamCMK:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "CMK for Kinesis stream ${StreamName}"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableRootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+
+          - Sid: AllowKinesisServiceUse
+            Effect: Allow
+            Principal:
+              Service: kinesis.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: scp-demo
+
+  KinesisStreamCMKAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${StreamName}-cmk"
+      TargetKeyId: !Ref KinesisStreamCMK
+
+  # -------------------------------------------------------
+  # Kinesis Data Stream (CMK encrypted)
+  # -------------------------------------------------------
+  KinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Ref StreamName
+      ShardCount: !Ref ShardCount
+      RetentionPeriodHours: !Ref RetentionPeriodHours
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !Ref KinesisStreamCMK
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: scp-demo
+
+  # -------------------------------------------------------
+  # IAM Role — Producer
+  # KMS grants included here to break circular dependency
+  # -------------------------------------------------------
+  KinesisProducerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StreamName}-producer-role"
+      Description: Demo producer role for SCP testing
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KinesisProducerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowStreamWrite
+                Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:ListShards
+                Resource: !GetAtt KinesisStream.Arn
+              - Sid: AllowCMKUseForProducer
+                Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !GetAtt KinesisStreamCMK.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: scp-demo
+
+  # -------------------------------------------------------
+  # IAM Role — Consumer
+  # KMS grants included here to break circular dependency
+  # -------------------------------------------------------
+  KinesisConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StreamName}-consumer-role"
+      Description: Demo consumer role for SCP testing
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KinesisConsumerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowStreamRead
+                Effect: Allow
+                Action:
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:ListShards
+                  - kinesis:SubscribeToShard
+                  - kinesis:RegisterStreamConsumer
+                  - kinesis:DeregisterStreamConsumer
+                  - kinesis:DescribeStreamConsumer
+                Resource:
+                  - !GetAtt KinesisStream.Arn
+                  - !Sub "${KinesisStream.Arn}/consumer/*"
+              - Sid: AllowCMKUseForConsumer
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !GetAtt KinesisStreamCMK.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: scp-demo
+
+# -------------------------------------------------------
+# Outputs
+# -------------------------------------------------------
+Outputs:
+  StreamName:
+    Description: Kinesis Stream name
+    Value: !Ref KinesisStream
+    Export:
+      Name: !Sub "${AWS::StackName}-StreamName"
+
+  StreamArn:
+    Description: Kinesis Stream ARN
+    Value: !GetAtt KinesisStream.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-StreamArn"
+
+  CMKArn:
+    Description: CMK ARN used for stream encryption
+    Value: !GetAtt KinesisStreamCMK.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CMKArn"
+
+  CMKAlias:
+    Description: CMK Alias
+    Value: !Ref KinesisStreamCMKAlias
+
+  ProducerRoleArn:
+    Description: ARN of the producer IAM role
+    Value: !GetAtt KinesisProducerRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ProducerRoleArn"
+
+  ConsumerRoleArn:
+    Description: ARN of the consumer IAM role
+    Value: !GetAtt KinesisConsumerRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ConsumerRoleArn"
+
+  TestCommandDescribeStream:
+    Description: Verify CMK encryption is active
+    Value: !Sub >
+      aws kinesis describe-stream-summary
+      --stream-name ${StreamName}
+      --query 'StreamDescriptionSummary.{Encryption:EncryptionType,KeyId:KeyId}'
+      --profile Work --region ${AWS::Region}
+
+  TestCommandStopEncryption:
+    Description: Test SCP deny — should fail once SCP is applied
+    Value: !Sub >
+      aws kinesis stop-stream-encryption
+      --stream-name ${StreamName}
+      --encryption-type KMS
+      --key-id ${KinesisStreamCMK.Arn}
+      --profile Work --region ${AWS::Region}
