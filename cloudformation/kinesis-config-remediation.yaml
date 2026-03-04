@@ -1,59 +1,11 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   AWS Config rule that detects Kinesis streams without CMK encryption
-  and auto-remediates by creating a CMK and enabling encryption.
+  and auto-remediates by dynamically creating a CMK (if one does not
+  already exist) and enabling encryption on the non-compliant stream.
+  No CMK is pre-deployed — it is created on first remediation only.
 
 Resources:
-
-  # -------------------------------------------------------
-  # CMK used by remediation to encrypt non-compliant streams
-  # -------------------------------------------------------
-  RemediationCMK:
-    Type: AWS::KMS::Key
-    Properties:
-      Description: CMK applied by Config auto-remediation to Kinesis streams
-      EnableKeyRotation: true
-      KeyPolicy:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: EnableRootAccess
-            Effect: Allow
-            Principal:
-              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
-            Action: "kms:*"
-            Resource: "*"
-          - Sid: AllowKinesisService
-            Effect: Allow
-            Principal:
-              Service: kinesis.amazonaws.com
-            Action:
-              - kms:GenerateDataKey
-              - kms:Decrypt
-            Resource: "*"
-            Condition:
-              StringEquals:
-                kms:CallerAccount: !Ref AWS::AccountId
-          - Sid: AllowSSMAutomationServiceUse
-            Effect: Allow
-            Principal:
-              Service: ssm.amazonaws.com
-            Action:
-              - kms:DescribeKey
-              - kms:GenerateDataKey
-              - kms:Decrypt
-            Resource: "*"
-            Condition:
-              StringEquals:
-                kms:CallerAccount: !Ref AWS::AccountId
-      Tags:
-        - Key: Purpose
-          Value: config-remediation
-
-  RemediationCMKAlias:
-    Type: AWS::KMS::Alias
-    Properties:
-      AliasName: alias/kinesis-config-remediation-cmk
-      TargetKeyId: !Ref RemediationCMK
 
   # -------------------------------------------------------
   # IAM Role — Lambda execution for Config rule evaluation
@@ -111,15 +63,10 @@ Resources:
           config  = boto3.client('config')
 
           def is_cmk(encryption_type, key_id):
-              """
-              Returns True only if the stream uses a customer managed key.
-              Rejects NONE and the AWS-managed key (aws/kinesis).
-              """
               if encryption_type != 'KMS':
                   return False
               if not key_id:
                   return False
-              # AWS-managed key identifiers contain 'aws/kinesis'
               if 'aws/kinesis' in str(key_id):
                   return False
               return True
@@ -164,7 +111,6 @@ Resources:
                               )
                           })
                   if evaluations:
-                      # PutEvaluations max 100 per call
                       for i in range(0, len(evaluations), 100):
                           config.put_evaluations(
                               Evaluations=evaluations[i:i+100],
@@ -188,7 +134,6 @@ Resources:
                   ResultToken=result_token
               )
 
-  # Allow Config to invoke the Lambda
   ConfigLambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -223,6 +168,8 @@ Resources:
 
   # -------------------------------------------------------
   # IAM Role — SSM Automation remediation
+  # Includes KMS create permissions — only exercised at
+  # remediation time when no CMK exists yet.
   # -------------------------------------------------------
   SSMRemediationRole:
     Type: AWS::IAM::Role
@@ -240,25 +187,38 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Effect: Allow
+              - Sid: AllowKinesisRemediation
+                Effect: Allow
                 Action:
                   - kinesis:StartStreamEncryption
                   - kinesis:DescribeStreamSummary
                 Resource: "*"
-              - Effect: Allow
+              - Sid: AllowKMSCreateAndUse
+                Effect: Allow
                 Action:
+                  - kms:CreateKey
+                  - kms:CreateAlias
+                  - kms:ListAliases
                   - kms:DescribeKey
-                  - kms:CreateGrant
+                  - kms:EnableKeyRotation
+                  - kms:TagResource
                   - kms:GenerateDataKey
                   - kms:Decrypt
-                Resource: !GetAtt RemediationCMK.Arn
-              - Effect: Allow
+                  - kms:CreateGrant
+                Resource: "*"
+              - Sid: AllowConfigEvaluations
+                Effect: Allow
                 Action:
                   - config:PutEvaluations
                 Resource: "*"
 
   # -------------------------------------------------------
-  # SSM Automation Document — enables CMK encryption
+  # SSM Automation Document
+  # Step 1: Check if remediation CMK alias already exists
+  # Step 2: Create CMK + alias if not (first run only)
+  # Step 3: Wait for stream ACTIVE
+  # Step 4: Enable CMK encryption
+  # Step 5: Verify
   # -------------------------------------------------------
   KinesisEnableCMKDocument:
     Type: AWS::SSM::Document
@@ -268,33 +228,112 @@ Resources:
       Content:
         schemaVersion: "0.3"
         description: >
-          Enables CMK encryption on a non-compliant Kinesis Data Stream.
-          Called automatically by AWS Config remediation.
+          Remediates a non-compliant Kinesis stream by finding or creating a
+          CMK (alias/kinesis-auto-remediation-cmk) and enabling encryption.
+          The CMK is only created on the first remediation run.
         assumeRole: "{{ AutomationAssumeRole }}"
         parameters:
           StreamName:
             type: String
             description: Name of the Kinesis stream to remediate
-          CMKArn:
-            type: String
-            description: ARN of the CMK to use for encryption
           AutomationAssumeRole:
             type: String
             description: IAM role ARN for SSM Automation to assume
         mainSteps:
-          - name: CheckCurrentEncryption
-            action: aws:executeAwsApi
-            description: Check current encryption state before remediating
+
+          - name: FindOrCreateCMK
+            action: aws:executeScript
+            description: >
+              Look up alias/kinesis-auto-remediation-cmk. If it does not exist,
+              create a new CMK with a proper key policy and attach the alias.
+              Returns the CMK ARN either way.
             inputs:
-              Service: kinesis
-              Api: DescribeStreamSummary
-              StreamName: "{{ StreamName }}"
+              Runtime: python3.8
+              Handler: find_or_create_cmk
+              InputPayload:
+                AccountId: !Ref AWS::AccountId
+                Region: !Ref AWS::Region
+              Script: |
+                import boto3
+                import json
+
+                def find_or_create_cmk(events, context):
+                    kms         = boto3.client('kms')
+                    alias_name  = 'alias/kinesis-auto-remediation-cmk'
+                    account_id  = events['AccountId']
+                    region      = events['Region']
+
+                    # Search for existing alias
+                    paginator = kms.get_paginator('list_aliases')
+                    for page in paginator.paginate():
+                        for alias in page.get('Aliases', []):
+                            if alias['AliasName'] == alias_name:
+                                key_info = kms.describe_key(KeyId=alias['TargetKeyId'])
+                                arn = key_info['KeyMetadata']['Arn']
+                                print(f"Found existing CMK: {arn}")
+                                return {'CMKArn': arn}
+
+                    # CMK does not exist — create it
+                    print("No existing CMK found — creating new CMK")
+                    key_policy = json.dumps({
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Sid": "EnableRootAccess",
+                                "Effect": "Allow",
+                                "Principal": {
+                                    "AWS": f"arn:aws:iam::{account_id}:root"
+                                },
+                                "Action": "kms:*",
+                                "Resource": "*"
+                            },
+                            {
+                                "Sid": "AllowKinesisService",
+                                "Effect": "Allow",
+                                "Principal": {
+                                    "Service": "kinesis.amazonaws.com"
+                                },
+                                "Action": [
+                                    "kms:GenerateDataKey",
+                                    "kms:Decrypt"
+                                ],
+                                "Resource": "*",
+                                "Condition": {
+                                    "StringEquals": {
+                                        "kms:CallerAccount": account_id
+                                    }
+                                }
+                            }
+                        ]
+                    })
+
+                    key = kms.create_key(
+                        Description='Auto-created CMK for Kinesis stream Config remediation',
+                        KeyUsage='ENCRYPT_DECRYPT',
+                        KeySpec='SYMMETRIC_DEFAULT',
+                        Policy=key_policy,
+                        Tags=[
+                            {'TagKey': 'Purpose',   'TagValue': 'kinesis-auto-remediation'},
+                            {'TagKey': 'CreatedBy', 'TagValue': 'aws-config-remediation'},
+                            {'TagKey': 'ManagedBy', 'TagValue': 'ssm-automation'}
+                        ]
+                    )
+
+                    key_arn = key['KeyMetadata']['Arn']
+                    key_id  = key['KeyMetadata']['KeyId']
+
+                    # Enable automatic key rotation
+                    kms.enable_key_rotation(KeyId=key_id)
+
+                    # Attach alias
+                    kms.create_alias(AliasName=alias_name, TargetKeyId=key_id)
+
+                    print(f"Created new CMK: {key_arn}")
+                    return {'CMKArn': key_arn}
+
             outputs:
-              - Name: EncryptionType
-                Selector: $.StreamDescriptionSummary.EncryptionType
-                Type: String
-              - Name: StreamStatus
-                Selector: $.StreamDescriptionSummary.StreamStatus
+              - Name: CMKArn
+                Selector: $.Payload.CMKArn
                 Type: String
 
           - name: WaitForStreamActive
@@ -310,17 +349,17 @@ Resources:
 
           - name: EnableCMKEncryption
             action: aws:executeAwsApi
-            description: Enable CMK encryption on the stream
+            description: Enable CMK encryption on the non-compliant stream
             inputs:
               Service: kinesis
               Api: StartStreamEncryption
               StreamName: "{{ StreamName }}"
               EncryptionType: KMS
-              KeyId: "{{ CMKArn }}"
+              KeyId: "{{ FindOrCreateCMK.CMKArn }}"
 
           - name: VerifyEncryption
             action: aws:waitForAwsResourceProperty
-            description: Confirm encryption is now ACTIVE with KMS
+            description: Confirm stream encryption type is now KMS
             timeoutSeconds: 120
             inputs:
               Service: kinesis
@@ -332,6 +371,7 @@ Resources:
 
   # -------------------------------------------------------
   # Config Remediation Configuration
+  # No static CMK ARN — CMK is resolved at remediation time
   # -------------------------------------------------------
   KinesisRemediationConfig:
     Type: AWS::Config::RemediationConfiguration
@@ -346,10 +386,6 @@ Resources:
         StreamName:
           ResourceValue:
             Value: RESOURCE_ID
-        CMKArn:
-          StaticValue:
-            Values:
-              - !GetAtt RemediationCMK.Arn
         AutomationAssumeRole:
           StaticValue:
             Values:
@@ -363,29 +399,29 @@ Outputs:
     Description: Config rule name
     Value: !Ref KinesisCMKConfigRule
 
-  RemediationCMKArn:
-    Description: CMK ARN used for auto-remediation
-    Value: !GetAtt RemediationCMK.Arn
-
-  RemediationCMKAlias:
-    Description: CMK alias
-    Value: !Ref RemediationCMKAlias
-
   SSMDocumentName:
     Description: SSM Automation document name
     Value: !Ref KinesisEnableCMKDocument
 
-  TestCommandTriggerRemediation:
-    Description: Manually trigger remediation on a non-compliant stream
-    Value: !Sub >
-      aws config start-remediation-execution
-      --config-rule-name kinesis-streams-must-use-cmk
-      --resource-keys resourceType=AWS::Kinesis::Stream,resourceId=<stream-name>
-      --profile Sandbox --region ${AWS::Region}
+  RemediationRoleArn:
+    Description: SSM remediation role ARN
+    Value: !GetAtt SSMRemediationRole.Arn
+
+  CMKAliasNote:
+    Description: Alias given to the CMK when first created by remediation
+    Value: alias/kinesis-auto-remediation-cmk
 
   TestCommandGetComplianceStatus:
     Description: Check compliance status of all Kinesis streams
     Value: !Sub >
-      aws config get-compliance-details-by-config-rule
+      aws configservice get-compliance-details-by-config-rule
       --config-rule-name kinesis-streams-must-use-cmk
+      --profile Sandbox --region ${AWS::Region}
+
+  TestCommandTriggerRemediation:
+    Description: Manually trigger remediation on a non-compliant stream
+    Value: !Sub >
+      aws configservice start-remediation-execution
+      --config-rule-name kinesis-streams-must-use-cmk
+      --resource-keys '[{"resourceType":"AWS::Kinesis::Stream","resourceId":"<stream-name>"}]'
       --profile Sandbox --region ${AWS::Region}
